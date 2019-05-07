@@ -1,0 +1,536 @@
+---
+title: "ML Final Project"
+author: "Atsumi Kainosho & Haley Townsend"
+date: "May 6, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+```{r}
+# First, load libraries
+library(Hmisc)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(readr)
+library(haven)
+library(foreign)
+library(RNHANES)
+library(purrr)
+library(magrittr)
+library(glmnet)
+library(keras)
+library(stringr)
+library(data.table)
+library(lubridate)
+library(caret)
+library(ROCR)
+library(rpart)
+library(rpart.plot)
+library(glmnet)
+library(randomForest)
+library(ada)
+library(gbm)
+```
+
+```{r}
+# Import data set
+# NHANES NNYFS 2012 data
+demo = read_xpt("C:\\Users\\atsum\\Documents\\GitHub\\ML-Final-Project\\Y_DEMO.xpt")
+write.csv(demo, file = 'C:\\Users\\atsum\\Documents\\GitHub\\ML-Final-Project\\attempt.csv')
+demodf = read_csv("C:\\Users\\atsum\\Documents\\GitHub\\ML-Final-Project\\attempt.csv")
+
+# under examinations, body measures
+body = read_xpt('C:\\Users\\atsum\\Documents\\GitHub\\ML-Final-Project\\Y_BMX.xpt')
+write.csv(body, file = 'body.csv')
+bodydf=read_csv('body.csv')
+
+```
+
+
+```{r}
+# DATA CLEANING
+
+rm(demo)
+rm(body)
+
+# Remove the X1 columns from both dfs
+demodf = demodf %>% select(-X1)
+bodydf = bodydf %>% select(-X1)
+
+# Join the demographic data to the body data
+df = left_join(bodydf, demodf, by = 'SEQN') 
+
+# look at where there is missing data
+colSums(is.na(df))
+
+# Include only the demographic columns of interest and the Y variable (BMDBMIC)
+df = df %>% select(RIAGENDR, RIDEXAGY,RIDRETH1, DMDBORN4, INDHHIN2, DMDHHSZA, BMDBMIC, SEQN) 
+
+# Rename the columns, so they are easier to understand
+names(df)[1]<-"gender"
+names(df)[2]<-"age"
+names(df)[3]<-"race"
+names(df)[4]<-"birth_country"
+names(df)[5]<-"annual_household_income"
+names(df)[6] <-"num_children_5yrs_younger"
+names(df)[7] <-"Y_BMI_category"
+
+# Clean the outcome variable so it is a biclassification problem instead of multi-class
+df = df %>% filter(!is.na(Y_BMI_category)) #%>% select(-SEQN) # will remove 5 rows of data missing the outcome
+
+# Relevel the outcome or BMI (Y) to have just two levels: Y is obese (obese:4) and
+#N is not obese (which includes underweight:1, normal:2, overweight:3)
+df = df %>% mutate(Y = case_when(
+  Y_BMI_category == 2 ~ 'N',
+  Y_BMI_category == 1 ~ 'N',
+  Y_BMI_category == 3 ~ 'N',
+  Y_BMI_category == 4 ~ 'Y'
+)) %>% select(-Y_BMI_category)
+
+# Need to change levels of factors for predictors: gender, race, birth_country, 
+cols <- c('gender', 'race', 'birth_country', 'Y')
+
+df[cols] <- lapply(df[cols], factor)
+
+# Gender, 1 is male and 2 is female
+df$gender <- ordered(df$gender,
+                     levels = c(1,2),
+                     labels = c("male", "female"))
+
+# Race, 1 is Mexican American, 2 is Other Hispanic, 3 Non-Hispanic White, 4 Non-Hispanic Black,
+# 5 Other Race
+df$race <- ordered(df$race,
+                   levels = c(1,2,3,4,5),
+                   labels = c("Mexican American", "Other Hispanic","White",
+                              "Black", "Other"))
+
+# birth_country, 1 is US, 2 is Other
+df$birth_country <- ordered(df$birth_country,
+                            levels = c(1,2),
+                            labels = c("USA", "Other"))
+
+# Regarding annual_household_income, 77 is Refused and 99 is Don't Know, so converth them as NA
+df$annual_household_income = na_if(df$annual_household_income, 99)
+df$annual_household_income = na_if(df$annual_household_income, 77)
+sum(is.na(df$annual_household_income))
+
+# annual_household_income into numeric using the average income in each group
+
+df = df %>% mutate(annual_household_income_num = case_when(
+  annual_household_income == 1 ~ 2500,
+  annual_household_income == 2 ~ 7500,
+  annual_household_income == 3 ~ 12500,
+  annual_household_income == 4 ~ 17500,
+  annual_household_income == 5 ~ 22500,
+  annual_household_income == 6 ~ 30000,
+  annual_household_income == 7 ~ 40000,
+  annual_household_income == 8 ~ 50000,
+  annual_household_income == 9 ~ 60000,
+  annual_household_income == 10 ~ 70000,
+  annual_household_income == 12 ~ 30000,
+  annual_household_income == 13 ~ 10000,
+  annual_household_income == 14 ~ 87500,
+  annual_household_income == 15 ~ 100000
+  )) %>% select(-annual_household_income)
+
+# remove unique ID from main dataframe
+df = df %>% select(-SEQN)
+
+# drop rows incluging NA
+df = df %>% na.omit()
+
+df %>% summary()
+
+```
+
+```{r}
+## Base features: gender, age, race, and birth country
+
+# Create a data frame containing base features and the outcome
+df_1 = df %>% select(gender, age, race, birth_country, Y)
+
+# RUNNING MODELS 
+
+# split into train and test data
+# Split back into train and test
+set.seed(518) # our graduation date!
+shuffled_df_1 = df_1[sample(1:nrow(df_1)),]
+n = round((0.75 * nrow(shuffled_df_1)),0)
+train_1 = df_1[1:n,]
+test_1 = df_1[-(1:n),]
+
+# Confirm that train and test are balanced with the outcome of interest (Y)
+train_1 %>% select(Y) %>% table() %>% prop.table()
+test_1 %>% select(Y) %>% table() %>% prop.table()
+
+# Running a base model, Logistic Regression
+lr_1 = with(train_1, glm(Y=="Y" ~.,
+                     family = binomial("logit"),
+                     data = train_1))
+lr_1 %>% summary()
+
+# Random Forest
+# Make the response variable a factor again so R knows to do binary classification for RF
+# consider ntrees for cross validation
+train_1$Y <- as.factor(train_1$Y)
+forest_1 = randomForest(formula = Y ~ .,
+                      data=train_1, ntrees=10)
+
+# AdaBoosting
+aforest_1 = ada(formula = Y=="Y" ~ .,
+              data=train_1,
+              iter=10)
+
+# Gradient Boosted Forest
+gforest_1 = gbm(formula = Y=="Y" ~ .,
+              data=train_1 %>%
+                mutate_if(is.logical, as.factor),
+              interaction.depth=10,
+              cv.folds = 2)
+
+# Lasso-Regularized Logistic Regression
+df_1$Y <- ordered(df_1$Y,
+                levels = c("N","Y"),
+                labels = c(0, 1))
+
+m_1 = model.matrix(Y~., df_1) # To numerically normalize values, apply model.matrix
+mtrain_1 = m_1[1:n,]
+mtest_1 = m_1[-(1:n),]
+
+train_labels_1 <- ordered(train_1$Y,
+                        levels = c("N","Y"),
+                        labels = c(0, 1))
+
+test_labels_1 <- ordered(test_1$Y,
+                       levels = c("N","Y"),
+                       labels = c(0, 1))
+
+lasso_cv_1 = cv.glmnet(x= mtrain_1, y=train_labels_1, family="binomial")  # perform cross-validation
+lasso_1 = glmnet(x = mtrain_1, y=train_labels_1, alpha = 1, family="binomial")
+
+
+# this code only for cv.glmnet since only cross-validation results can provide the minimum lambda
+bestlam_1 = lasso_cv_1$lambda.min 
+
+# Look at coefficients
+lasso_1.coef = predict(lasso_1, type="coefficients", s= bestlam_1)
+lasso_1.coef
+
+
+# need results in a dataframe so can plot ROC
+preds_1 = predict(lasso_1, newx = mtest_1, s = bestlam_1, type = "response")
+
+### ROC curves
+# Logistic Regression
+logit_prediction_1 = predict(lr_1,test_1)
+logit_rocdata_1 = prediction(predictions=logit_prediction_1,
+                           labels=test_1$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_lg_1 =  prediction(predictions=logit_prediction_1,
+                     labels=test_1$Y) %>% performance("auc")
+auc_lg_1 = round(auc_lg_1@y.values[[1]],3)
+
+
+# Random Forest
+test_1$Y <- as.factor(test_1$Y)
+rf_prediction_1 = predict(forest_1, test_1, type = "prob")
+rf_rocdata_1 = prediction(predictions=rf_prediction_1[,2],
+                        labels=test_1$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_rf_1 = prediction(predictions=rf_prediction_1[,2],
+                      labels=test_1$Y) %>% performance("auc")
+auc_rf_1 = round(auc_rf_1@y.values[[1]],3)
+
+#boosting
+boosting_prediction_1 = predict(aforest_1, test_1, type = "prob")
+boosting_rocdata_1 = prediction(predictions=boosting_prediction_1[,2],
+                              labels=test_1$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_boosting_1 = prediction(predictions=boosting_prediction_1[,2],
+                          labels=test_1$Y) %>% performance("auc")
+auc_boosting_1 = round(auc_boosting_1@y.values[[1]],3)
+
+#gradient boosting
+gradient_prediction_1 = predict(gforest_1, test_1,
+                              n.trees=gforest$n.trees,type = "response")
+gradient_rocdata_1 = prediction(predictions=gradient_prediction_1,
+                              labels=test_1$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_gradient_1 = prediction(predictions=gradient_prediction_1,
+                          labels=test_1$Y) %>% performance("auc")
+auc_gradient_1 = round(auc_gradient_1@y.values[[1]],3)
+
+
+#Lasso, logistic regularized regression
+lasso_prediction_1 = predict(lasso_1, mtest_1, s= bestlam_1, type='response')
+lasso_rocdata_1 = prediction(predictions=lasso_prediction_1,
+                           labels=test_labels_1) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_lasso_1 =  prediction(predictions=lasso_prediction_1,
+                        labels=test_labels_1) %>% performance("auc")
+auc_lasso_1 = round(auc_lasso_1@y.values[[1]],3)
+
+
+# plot ROC curve
+ggplot(data = logit_rocdata_1, aes(x=FPR,y=TPR, col = paste0("Logistic Regression: AUC", auc_lg_1))) + geom_line() +
+  geom_line(data = rf_rocdata_1, aes(x=FPR,y=TPR, col = paste0("RF: AUC", auc_rf_1))) +
+  geom_line(data = boosting_rocdata_1, aes(x=FPR,y=TPR, col = paste0("Boosting: AUC", auc_boosting_1))) +
+  geom_line(data = gradient_rocdata_1, aes(x=FPR,y=TPR, col = paste0("Gradient boosting: AUC", auc_gradient_1))) + 
+  geom_line(data = lasso_rocdata_1, aes(x=FPR,y=TPR, col = paste0("Lasso: AUC", auc_lasso_1))) +
+  theme(legend.title=element_blank())
+
+
+```
+
+```{r}
+## Updated features
+# gender, age, race, and birth_country PLUS annual household income and nunmber of children younger than 5 years old, and fat
+
+df_2 = df %>% select(gender, age, race, birth_country, num_children_5yrs_younger, annual_household_income_num, Y)
+
+# RUNNING MODELS 
+# Step 1, split into train and test data
+# Split back into train and test
+set.seed(518) # our graduation date!
+shuffled_df_2 = df_2[sample(1:nrow(df_2)),]
+n = round((0.75 * nrow(shuffled_df_2)),0)
+train_2 = df_2[1:n,]
+test_2 = df_2[-(1:n),]
+
+# Confirm that train and test are balanced with the outcome of interest (Y)
+train_2 %>% select(Y) %>% table() %>% prop.table()
+test_2 %>% select(Y) %>% table() %>% prop.table()
+
+# Running a variety of models
+# Logistic Regression
+lr_2 = with(train_2, glm(Y=="Y" ~ .,
+                         family = binomial("logit"),
+                         data = train_2))
+lr_2 %>% summary()
+
+
+# Random Forest
+# Make the response variable a factor again so R knows to do binary classification for RF
+# consider ntrees for cross validation
+train_2$Y <- as.factor(train_2$Y)
+forest_2 = randomForest(formula = Y ~ .,
+                        data=train_2, ntrees=10)
+
+# Boosting
+# Example adaboost
+aforest_2 = ada(formula = Y=="Y" ~ .,
+                data=train_2,
+                iter=10)
+
+# Gradient Boosting
+# Example gradient boosted forest
+gforest_2 = gbm(formula = Y=="Y" ~ .,
+                data=train_2 %>%
+                  mutate_if(is.logical, as.factor),
+                interaction.depth=10,
+                cv.folds = 2)
+
+# Lasso-Regularized Logistic Regression
+df_2$Y <- ordered(df_2$Y,
+                  levels = c("N","Y"),
+                  labels = c(0, 1))
+
+m_2 = model.matrix(Y~., df_2) # To numerically normalize values, apply model.matrix
+mtrain_2 = m_2[1:n,]
+mtest_2 = m_2[-(1:n),]
+
+train_labels_2 <- ordered(train_2$Y,
+                          levels = c("N","Y"),
+                          labels = c(0, 1))
+
+test_labels_2 <- ordered(test_2$Y,
+                         levels = c("N","Y"),
+                         labels = c(0, 1))
+
+lasso_cv_2 = cv.glmnet(x= mtrain_2, y=train_labels_2, family="binomial")  # perform cross-validation
+lasso_2 = glmnet(x = mtrain_2, y=train_labels_2, alpha = 1, family="binomial")
+
+
+# this code only for cv.glmnet since only cross-validation results can provide the minimum lambda
+bestlam_2 = lasso_cv_2$lambda.min 
+
+# Look at coefficients
+lasso_2.coef = predict(lasso_2, type="coefficients", s= bestlam_2)
+lasso_2.coef
+
+
+# need results in a dataframe so can plot ROC
+preds_2 = predict(lasso_2, newx = mtest_2, s = bestlam_2, type = "response")
+
+### ROC curves
+# Logistic Regression
+logit_prediction_2 = predict(lr_2,test_2)
+logit_rocdata_2 = prediction(predictions=logit_prediction_2,
+                             labels=test_2$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_lg_2 =  prediction(predictions=logit_prediction_2,
+                       labels=test_2$Y) %>% performance("auc")
+auc_lg_2 = round(auc_lg_2@y.values[[1]],3)
+
+# Random Forest
+test_2$Y <- as.factor(test_2$Y)
+rf_prediction_2 = predict(forest_2, test_2, type = "prob")
+rf_rocdata_3 = prediction(predictions=rf_prediction_2[,2],
+                          labels=test_2$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_rf_2 = prediction(predictions=rf_prediction_2[,2],
+                      labels=test_2$Y) %>% performance("auc")
+auc_rf_2 = round(auc_rf_2@y.values[[1]],3)
+
+#boosting
+boosting_prediction_2 = predict(aforest_2, test_2, type = "prob")
+boosting_rocdata_2 = prediction(predictions=boosting_prediction_2[,2],
+                                labels=test_2$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_boosting_2 = prediction(predictions=boosting_prediction_2[,2],
+                            labels=test_2$Y) %>% performance("auc")
+auc_boosting_2 = round(auc_boosting_2@y.values[[1]],3)
+
+#gradient boosting
+gradient_prediction_2 = predict(gforest_2, test_2,
+                                n.trees=gforest$n.trees,type = "response")
+gradient_rocdata_2 = prediction(predictions=gradient_prediction_2,
+                                labels=test_2$Y) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_gradient_2 = prediction(predictions=gradient_prediction_2,
+                            labels=test_2$Y) %>% performance("auc")
+auc_gradient_2 = round(auc_gradient_2@y.values[[1]],3)
+
+
+#Lasso, logistic regularized regression
+lasso_prediction_2 = predict(lasso_2, mtest_2, s= bestlam_2, type='response')
+lasso_rocdata_2 = prediction(predictions=lasso_prediction_2,
+                             labels=test_labels_2) %>%
+  performance("tpr", "fpr") %>%
+  (function(.) data.frame(FPR=.@x.values[[1]], TPR=.@y.values[[1]]) %>% as_tibble())(.) 
+
+auc_lasso_2 =  prediction(predictions=lasso_prediction_2,
+                          labels=test_labels_2) %>% performance("auc")
+auc_lasso_2 = round(auc_lasso_2@y.values[[1]],3)
+
+
+# plot ROC curve
+ggplot(data = logit_rocdata_2, aes(x=FPR,y=TPR, col = paste0("Logistic Regression: AUC", auc_lg_2))) + geom_line() +
+  geom_line(data = rf_rocdata_2, aes(x=FPR,y=TPR, col = paste0("RF: AUC", auc_rf_2))) +
+  geom_line(data = boosting_rocdata_2, aes(x=FPR,y=TPR, col = paste0("Boosting: AUC", auc_boosting_2))) +
+  geom_line(data = gradient_rocdata_2, aes(x=FPR,y=TPR, col = paste0("Gradient boosting: AUC", auc_gradient_2))) + 
+  geom_line(data = lasso_rocdata_2, aes(x=FPR,y=TPR, col = paste0("Lasso: AUC", auc_lasso_2))) +
+  theme(legend.title=element_blank())
+
+## NEURAL NETWORK ##
+# Create train and test set that do not include missing columns to make things simple
+
+xtrain_2 = train_2 %>% select(-Y) # Exclude BMI for the normalization
+ytrain_2 = train_labels_2 %>% as.matrix()
+xtest_2 = test_2 %>% select(-Y) # Exclude BMI for the normalization
+ytest_2 = test_labels_2 %>% as.matrix()
+
+dmy_train_2 = dummyVars(~., data = xtrain_2)
+trsf_train_2 <- as.data.frame(predict(dmy_train_2,xtrain_2)) %>% as.matrix()
+
+dmy_test_2 = dummyVars(~ ., data = xtest_2)
+trsf_test_2 <- as.data.frame(predict(dmy_test_2,xtest_2)) %>% as.matrix()
+
+# Report demension of the train set
+dim(trsf_train_2)
+
+### Specify the architecture
+model = keras_model_sequential() 
+model %>%  # order layer 
+  layer_dense(units = 32, 
+              activation = 'relu',
+              input_shape = c(ncol(trsf_train_2))) %>%  
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_dense(units = 32, activation = 'relu',
+              kernel_regularizer = regularizer_l2(l = 0.01)) %>%  
+  layer_dense(units = 1, activation = 'sigmoid')  
+
+summary(model)
+
+### Specify loss and optimization method
+model %>% compile(
+  loss = c('mse'),
+  optimizer = optimizer_nadam(clipnorm = 10),
+  metrics = c('mse')
+)
+
+### Train model
+inner_epochs = 10
+early_stopping = callback_early_stopping(monitor = "val_loss",
+                                         patience = inner_epochs/2)
+bestLoss = 1e10
+for(i in 1:20) {
+  history = model %>% fit(trsf_train_2 , ytrain_2,
+                          epochs = inner_epochs,
+                          callbacks = c(early_stopping),
+                          batch_size = 16,  
+                          validation_split = 0.2, shuffle=T)
+  loss = history$metrics$val_loss[length(history$metrics$val_loss)]
+  if(loss < bestLoss) {
+    bestLoss = loss
+    model %>% save_model_weights_hdf5("my_model_weights.h5")
+  }
+  if(length(history$metrics$val_loss) < inner_epochs)
+    break
+}
+
+### Plot performance 
+plot(history, metrics = "loss")  # only plots the last part of training
+
+### Load the early-stopping model
+bestModel = model %>% load_model_weights_hdf5('my_model_weights.h5')
+bestModel %>% compile(
+  # loss = 'categorical_crossentropy',
+  loss = 'mse',
+  optimizer = optimizer_nadam(),
+  metrics = c('mse')
+)
+
+### Make predictions
+bestModel %>% evaluate(trsf_test_2, ytest_2)
+predition_2 = bestModel %>% predict_on_batch(trsf_test_2) 
+
+# Plot
+rownum = 1:nrow(ytest_2)
+ytest = cbind(ytest_2,rownum)
+summarytable = cbind(ytest_2, predition_2[,1]) %>% as.data.frame()
+
+```
+
